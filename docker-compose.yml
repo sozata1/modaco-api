@@ -1,0 +1,248 @@
+# ModaCo — the whole system with one command: `docker compose up -d --build`
+#
+# Topology:
+#   postgres <-- pgbouncer <-- api / projector / ingestion-worker
+#      ^ (direct, DDL only)
+#   migrate
+#
+#   localstack (S3 + SQS) <-- api (presigned upload, splitter) <-- ingestion-worker
+#   redis <-- api (cache) + projector (BullMQ)
+
+name: modaco
+
+x-app-base: &app-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+  image: modaco/app:local
+  env_file: [.env]
+  restart: unless-stopped
+  depends_on:
+    migrate: { condition: service_completed_successfully }
+    redis: { condition: service_healthy }
+    redis-queue: { condition: service_healthy }
+    pgbouncer: { condition: service_started }
+  # All application logs are JSON (pino); keep them structured on the compose side too.
+  logging:
+    driver: json-file
+    options: { max-size: '10m', max-file: '3' }
+
+services:
+  # ── Data layer ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # max_connections is deliberately left at 100, close to the RDS default.
+    # Demonstrating that concurrent Lambdas exhaust it WITHOUT PgBouncer is part of
+    # the evidence for Scenario A, so raising it here would hide the problem.
+    command:
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - track_io_timing=on
+      - -c
+      - log_min_duration_statement=500
+    ports: ['${POSTGRES_HOST_PORT:-5432}:5432']
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # Connection-storm protection. In Scenario A dozens of workers connect at once;
+  # transaction pooling keeps the number of backend connections flat so the API's own
+  # pool is never starved. This is RDS Proxy's local stand-in.
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: '1000'
+      DEFAULT_POOL_SIZE: '25'
+      AUTH_TYPE: scram-sha-256
+      LISTEN_PORT: '6432'
+    ports: ['${PGBOUNCER_HOST_PORT:-6432}:6432']
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  # Two Redis instances, because cache and queue want opposite eviction policies and
+  # the policy is per-instance, not per-database.
+  #
+  # The cache wants allkeys-lru: dropping the coldest entry under memory pressure is
+  # the correct failure mode for data that can be rebuilt from PostgreSQL.
+  # The queue wants noeviction: a projection job silently evicted means a product keeps
+  # the wrong price forever, with nothing anywhere recording that it happened.
+  #
+  # Sharing one instance means choosing which of those two is allowed to be wrong.
+  redis:
+    image: redis:7-alpine
+    command:
+      ['redis-server', '--appendonly', 'no', '--maxmemory', '512mb', '--maxmemory-policy', 'allkeys-lru']
+    ports: ['${REDIS_HOST_PORT:-6379}:6379']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-queue:
+    image: redis:7-alpine
+    # AOF on: an unacknowledged job must survive a restart.
+    command:
+      ['redis-server', '--appendonly', 'yes', '--maxmemory', '256mb', '--maxmemory-policy', 'noeviction']
+    ports: ['${REDIS_QUEUE_HOST_PORT:-6380}:6379']
+    volumes: ['queuedata:/data']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:3
+    environment:
+      SERVICES: s3,sqs
+      DEBUG: '0'
+      AWS_DEFAULT_REGION: ${AWS_REGION}
+      SKIP_SSL_CERT_DOWNLOAD: '1'
+    ports: ['${LOCALSTACK_HOST_PORT:-4566}:4566']
+    volumes:
+      - './infra/localstack/init:/etc/localstack/init/ready.d:ro'
+      - 'localstack-data:/var/lib/localstack'
+    healthcheck:
+      # Checks that BOOTSTRAP finished, not merely that SQS answers. `list-queues`
+      # succeeds the moment the service is up — before the init script has created
+      # anything — so consumers started, found no queue, and crash-looped until the
+      # restart policy happened to catch them. Probing for a resource the bootstrap
+      # creates makes `depends_on: service_healthy` mean what it says.
+      test:
+        ['CMD-SHELL', 'awslocal sqs get-queue-url --queue-name ${SQS_SPLITTER_QUEUE:-modaco-splitter} >/dev/null 2>&1 || exit 1']
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 20s
+
+  # ── Schema ────────────────────────────────────────────────────────────────
+  # One-shot. DDL goes straight to postgres: transaction pooling does not preserve
+  # session state, so migrations must not pass through the proxy.
+  migrate:
+    <<: *app-base
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DATABASE_URL: ${DATABASE_DIRECT_URL}
+    restart: 'no'
+    command: ['node', 'packages/db/dist/bin/migrate.js']
+
+  # ── Application services ──────────────────────────────────────────────────
+  api:
+    <<: *app-base
+    ports: ['${PORT:-3000}:3000']
+    environment:
+      SERVICE_NAME: api
+      DB_POOL_MAX: ${API_DB_POOL_MAX}
+    command: ['node', 'apps/api/dist/server.js']
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # Scenario B: flash-sale projection, scheduled promotion activation, reconciler.
+  projector:
+    <<: *app-base
+    environment:
+      SERVICE_NAME: projector
+      DB_POOL_MAX: '10'
+    ports: ['${PROJECTOR_METRICS_PORT:-3001}:3001']
+    command: ['node', 'apps/projector/dist/main.js']
+
+  # Scenario A: the local stand-in for an SQS event source mapping. It polls the queue
+  # and invokes the REAL Lambda handler with a genuine SQSEvent and Context, so the
+  # handler deploys to the `nodejs22.x` runtime unchanged. The handler is the unit
+  # under test; the invoker is swappable.
+  ingestion-worker:
+    <<: *app-base
+    environment:
+      SERVICE_NAME: ingestion-worker
+      DB_POOL_MAX: ${INGESTION_DB_POOL_MAX}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      redis-queue: { condition: service_healthy }
+      pgbouncer: { condition: service_started }
+      localstack: { condition: service_healthy }
+    command: ['node', 'apps/ingestion/dist/bin/worker-runner.js']
+    deploy:
+      # Worker replicas stand in for Lambda reserved concurrency.
+      # `docker compose up --scale ingestion-worker=N` exercises the fan-out.
+      replicas: 2
+
+  # Drives the splitter from S3 bucket notifications. In AWS this process does not
+  # exist — the notification invokes the Lambda directly — so exactly one replica here,
+  # matching the single trigger it stands in for.
+  ingestion-splitter:
+    <<: *app-base
+    environment:
+      SERVICE_NAME: ingestion-splitter
+      DB_POOL_MAX: '2'
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      redis-queue: { condition: service_healthy }
+      pgbouncer: { condition: service_started }
+      localstack: { condition: service_healthy }
+    command: ['node', 'apps/ingestion/dist/bin/splitter-runner.js']
+
+  # Measurement tooling, deliberately NOT in the runtime image: it exists to observe the
+  # system, not to be part of it. Built from the `build` stage, which still has the dev
+  # dependencies and the sources.
+  #
+  # It runs inside the compose network on purpose. Measured from the host, Docker
+  # Desktop's port forwarding dominates the result — a primary-key read appeared to take
+  # 36ms at 10 connections, about ten times its real cost.
+  #
+  #   docker compose run --rm bench node bench/dist/bench-detail.js
+  #   docker compose run --rm bench node bench/dist/generate-feed.js 500000
+  bench:
+    profiles: ['bench']
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: build
+    image: modaco/bench:local
+    env_file: [.env]
+    environment:
+      BENCH_API: http://api:3000
+      BENCH_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      AWS_ENDPOINT_URL: http://localstack:4566
+    depends_on:
+      api: { condition: service_healthy }
+    entrypoint: ['node']
+    command: ['bench/dist/bench-detail.js']
+
+volumes:
+  pgdata:
+  queuedata:
+  localstack-data:

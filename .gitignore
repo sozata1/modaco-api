@@ -1,0 +1,21 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+
+# Environment. .env.example is the committed template and must stay tracked.
+.env
+.env.*
+!.env.example
+
+# Local runtime state
+.localstack/
+tmp/
+*.log
+
+# Editor and OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,34 @@
+-- ============================================================================
+-- 0002 — Bound the reconciler's scan, and give the projector's batch an index.
+--
+-- Both indexes exist because a measurement said so, not because they looked useful.
+-- ============================================================================
+
+-- The reconciler swept the whole table every 60 seconds:
+--
+--   findStaleProductIds          3,182 ms   519,208 buffers  (Seq Scan 499,991 + LATERAL/row)
+--   measureProjectionLagSeconds  5,967 ms   519,197 buffers  (same, without even a LIMIT)
+--
+-- Nine seconds of full-table LATERAL every minute, to return zero rows. The wall-clock
+-- cost is not the worst of it: a million buffer touches per minute evict the storefront's
+-- hot pages from shared_buffers, so the safety net was quietly undoing the cache it was
+-- meant to protect.
+--
+-- The sweep now pages through the primary key with a bounded window and an explicit
+-- cursor, so no new index is needed for it — products_pkey already orders by id.
+--
+-- An earlier attempt ordered the window by `price_computed_at` instead, on the theory
+-- that repairing a row would send it to the back of the queue. It does not rotate:
+-- a row found CORRECT is not reprojected, so its timestamp never moves, and the sweep
+-- re-examines the same oldest rows forever without ever reaching the rest of the table.
+-- Progress has to come from the scan, not from the repair.
+
+-- projectPricesForCategoryBatch pages through one category ordered by id. With only
+-- (category, effective_price_cents, id) available, PostgreSQL chose to walk the PRIMARY
+-- KEY in id order and filter on category — 237 ms and 30,349 buffers to collect 5,000
+-- rows from a category holding a sixth of the table, because most pages it read were
+-- other categories.
+--
+-- A flash sale over 83K products is ~17 such batches, so this is seconds of avoidable
+-- page reads on the exact write path Scenario B is built around.
+CREATE INDEX idx_products_category_id ON products (category, id) WHERE is_active;

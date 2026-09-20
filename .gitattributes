@@ -1,0 +1,9 @@
+# Normalise line endings so the repo is identical on macOS, Linux and Windows.
+* text=auto eol=lf
+
+# Shell scripts run inside Linux containers; CRLF would break the shebang.
+*.sh    text eol=lf
+Dockerfile text eol=lf
+
+# Generated, but committed as a deliverable — keep it out of diff noise reviews.
+schema.sql linguist-generated=false

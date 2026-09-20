@@ -1,0 +1,20 @@
+{
+  "name": "@modaco/ingestion",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.716.0",
+    "@aws-sdk/client-sqs": "^3.716.0",
+    "@modaco/core": "*",
+    "@modaco/db": "*",
+    "kysely": "^0.27.4",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "@modaco/observability": "*"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.147"
+  }
+}

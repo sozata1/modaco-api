@@ -1,0 +1,228 @@
+{
+  "info": {
+    "name": "ModaCo — Promotion Management API",
+    "description": "Ordered as a walkthrough: create a product, put it under a category flash sale, watch the effective price change, and prove the one-active-promotion rule is enforced by the database.\n\nRun the requests top to bottom — several store ids into collection variables that later requests read.\n\nStart the system first:\n\n    cp .env.example .env && docker compose up -d --build\n\nSet `baseUrl` if the API is not on http://localhost:3000.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000" },
+    { "key": "productId", "value": "" },
+    { "key": "scarfId", "value": "" },
+    { "key": "promotionId", "value": "" },
+    { "key": "conflictingPromotionId", "value": "" },
+    { "key": "jobId", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Liveness",
+          "request": { "method": "GET", "url": "{{baseUrl}}/health/live" }
+        },
+        {
+          "name": "Readiness",
+          "request": { "method": "GET", "url": "{{baseUrl}}/health/ready" },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('ready', () => pm.response.to.have.status(200));",
+            "// Redis being down is reported but does not fail readiness: the cache fails",
+            "// open, so the service is still correct, only slower.",
+            "pm.test('database reachable', () => pm.expect(pm.response.json().checks.database).to.be.true);"
+          ] } }]
+        },
+        {
+          "name": "Metrics (Prometheus)",
+          "request": { "method": "GET", "url": "{{baseUrl}}/metrics" }
+        }
+      ]
+    },
+    {
+      "name": "1 · Products",
+      "item": [
+        {
+          "name": "Create product — Leather Belt",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/v1/products",
+            "body": { "mode": "raw", "raw": "{\n  \"sku\": \"ACC-100\",\n  \"name\": \"Leather Belt\",\n  \"category\": \"Accessories\",\n  \"basePrice\": \"149.99\",\n  \"stockQuantity\": 40\n}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('created', () => pm.response.to.have.status(201));",
+            "const d = pm.response.json().data;",
+            "pm.collectionVariables.set('productId', d.id);",
+            "pm.test('no promotion yet', () => pm.expect(d.effectivePrice).to.eql('149.99'));"
+          ] } }]
+        },
+        {
+          "name": "Get product (highest-traffic endpoint)",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/products/{{productId}}" },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('200', () => pm.response.to.have.status(200));",
+            "// Served cache-aside. The second call for the same id comes from Redis;",
+            "// see ADR-012 for what that is actually buying.",
+            "pm.test('carries a request id', () => pm.expect(pm.response.headers.get('x-request-id')).to.be.a('string'));"
+          ] } }]
+        },
+        {
+          "name": "List — sorted by effective price",
+          "request": { "method": "GET", "url": {
+            "raw": "{{baseUrl}}/api/v1/products?sort=effective_price&limit=20",
+            "host": ["{{baseUrl}}"], "path": ["api","v1","products"],
+            "query": [
+              { "key": "sort", "value": "effective_price", "description": "or -effective_price" },
+              { "key": "limit", "value": "20", "description": "max 100" },
+              { "key": "category", "value": "Accessories", "disabled": true },
+              { "key": "minPrice", "value": "10.00", "disabled": true },
+              { "key": "maxPrice", "value": "500.00", "disabled": true },
+              { "key": "cursor", "value": "", "description": "page.nextCursor from the previous response", "disabled": true }
+            ] } },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('200', () => pm.response.to.have.status(200));",
+            "const body = pm.response.json();",
+            "// Keyset pagination: follow page.nextCursor. There is no offset parameter,",
+            "// because offset skips and repeats rows when prices shift mid-browse.",
+            "pm.test('paginated by cursor', () => pm.expect(body.page).to.have.property('nextCursor'));"
+          ] } }]
+        },
+        {
+          "name": "Rejected — unsupported sort field",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/products?sort=name" },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "// The sortable set is closed on purpose: an arbitrary sort column would",
+            "// silently mean a full scan.",
+            "pm.test('422', () => pm.response.to.have.status(422));"
+          ] } }]
+        }
+      ]
+    },
+    {
+      "name": "2 · Flash sale",
+      "item": [
+        {
+          "name": "Create promotion (draft)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/v1/promotions",
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Flash: 50% off Accessories\",\n  \"discountType\": \"percentage\",\n  \"discountValue\": 50,\n  \"startsAt\": \"2026-01-01T00:00:00Z\",\n  \"endsAt\": \"2027-01-01T00:00:00Z\"\n}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('created as draft', () => { pm.response.to.have.status(201);",
+            "  pm.expect(pm.response.json().data.status).to.eql('draft'); });",
+            "pm.collectionVariables.set('promotionId', pm.response.json().data.id);"
+          ] } }]
+        },
+        {
+          "name": "Assign to a category and publish",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/v1/promotions/{{promotionId}}/assign",
+            "body": { "mode": "raw", "raw": "{\n  \"targetType\": \"category\",\n  \"category\": \"Accessories\"\n}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "// 202, not 200. One row is written and this returns in about a millisecond;",
+            "// the 50,000 price updates it implies are applied asynchronously.",
+            "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+            "pm.test('projection pending', () => pm.expect(pm.response.json().projection.status).to.eql('pending'));"
+          ] } }]
+        },
+        {
+          "name": "Product created DURING the sale is already discounted",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/v1/products",
+            "body": { "mode": "raw", "raw": "{\n  \"sku\": \"ACC-200\",\n  \"name\": \"Silk Scarf\",\n  \"category\": \"Accessories\",\n  \"basePrice\": \"249.99\",\n  \"stockQuantity\": 10\n}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "const d = pm.response.json().data;",
+            "pm.collectionVariables.set('scarfId', d.id);",
+            "// Resolved in the same transaction as the insert — no background job races",
+            "// the first read.",
+            "pm.test('249.99 -> 125.00', () => pm.expect(d.effectivePrice).to.eql('125.00'));"
+          ] } }]
+        },
+        {
+          "name": "Overlapping promotion is refused",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/v1/promotions",
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Overlapping\",\n  \"discountType\": \"fixed\",\n  \"discountValue\": \"10.00\",\n  \"startsAt\": \"2026-06-01T00:00:00Z\",\n  \"endsAt\": \"2026-07-01T00:00:00Z\"\n}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.collectionVariables.set('conflictingPromotionId', pm.response.json().data.id);"
+          ] } }]
+        },
+        {
+          "name": "… assigning it returns 409",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/v1/promotions/{{conflictingPromotionId}}/assign",
+            "body": { "mode": "raw", "raw": "{\n  \"targetType\": \"category\",\n  \"category\": \"Accessories\"\n}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "// Rejected by an EXCLUDE constraint in PostgreSQL, not by an application check.",
+            "// Two concurrent publishes would both pass a SELECT-then-INSERT guard.",
+            "pm.test('409 Conflict', () => pm.response.to.have.status(409));",
+            "pm.test('RFC 7807 body', () => { const b = pm.response.json();",
+            "  pm.expect(b.code).to.eql('PROMOTION_OVERLAP');",
+            "  pm.expect(b).to.have.property('requestId');",
+            "  pm.expect(b).to.not.have.property('stack'); });"
+          ] } }]
+        },
+        {
+          "name": "Cancel the sale",
+          "request": { "method": "PATCH", "url": "{{baseUrl}}/api/v1/promotions/{{promotionId}}/cancel" },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+            "// Soft cancel. The row is referenced by products.active_promotion_id and is",
+            "// part of the pricing audit trail."
+          ] } }]
+        }
+      ]
+    },
+    {
+      "name": "3 · Bulk ingestion",
+      "item": [
+        {
+          "name": "Request a presigned upload URL",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/v1/imports/upload-url",
+            "body": { "mode": "raw", "raw": "{ \"fileName\": \"vendor-feed.csv\" }" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "// The API never handles the bytes. PUT the CSV straight to S3 with the returned",
+            "// URL; the bucket notification is what starts ingestion.",
+            "pm.test('201', () => pm.response.to.have.status(201));"
+          ] } }]
+        },
+        {
+          "name": "List import jobs",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/imports" },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "const jobs = pm.response.json().data;",
+            "if (jobs.length) pm.collectionVariables.set('jobId', jobs[0].id);"
+          ] } }]
+        },
+        {
+          "name": "Job progress",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/imports/{{jobId}}" },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "// 'partial' means some rows were malformed and recorded — not that the job",
+            "// failed. Nine bad rows out of 500,000 is a to-do list, not a rollback."
+          ] } }]
+        },
+        {
+          "name": "Rejected rows for a job",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/v1/imports/{{jobId}}/errors" }
+        }
+      ]
+    }
+  ]
+}

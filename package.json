@@ -1,0 +1,43 @@
+{
+  "name": "modaco",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "bench"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean && rm -rf packages/*/dist apps/*/dist bench/dist",
+    "typecheck": "tsc -b --force",
+    "lint": "eslint .",
+    "format": "prettier --write \"**/*.{ts,json,md,yml}\"",
+    "test": "vitest run",
+    "test:unit": "vitest run packages",
+    "test:watch": "vitest",
+    "migrate": "tsx packages/db/src/bin/migrate.ts",
+    "schema:dump": "cat packages/db/migrations/*.sql > schema.sql && echo 'schema.sql yazildi'",
+    "up": "npm run setup && docker compose up -d --build",
+    "down": "docker compose down -v",
+    "logs": "docker compose logs -f api projector ingestion-worker",
+    "setup": "[ -f .env ] || cp .env.example .env",
+    "feed": "node bench/dist/generate-feed.js",
+    "bench:detail": "node bench/dist/bench-detail.js",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "seed": "docker compose run --rm --entrypoint node api packages/db/dist/bin/seed.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.0",
+    "eslint": "^9.17.0",
+    "prettier": "^3.4.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.18.0",
+    "vitest": "^2.1.0"
+  }
+}
